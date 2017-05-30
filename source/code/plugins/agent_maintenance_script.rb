@@ -1,5 +1,8 @@
 require 'optparse'
 
+# Error codes
+NON_PRIVELEGED_USER_ERROR_CODE = 2
+
 module MaintenanceModule
 
   class Maintenance
@@ -321,14 +324,14 @@ module MaintenanceModule
       # Check necessary inputs
       if @load_config_success != 0
         log_error("Error loading configuration from #{@omsadmin_conf_path}")
-        return 1
+        return 1 # TODO config error code?
       elsif @WORKSPACE_ID.nil? or @AGENT_GUID.nil? or @URL_TLD.nil? or
           @WORKSPACE_ID.empty? or @AGENT_GUID.empty? or @URL_TLD.empty?
         log_error("Missing required field from configuration file: #{@omsadmin_conf_path}")
-        return 1
+        return 1 # TODO config error code? - correlate with omsadmin?
       elsif !file_exists_nonempty(@cert_path) or !file_exists_nonempty(@key_path)
         log_error("Certificates for heartbeat request do not exist")
-        return 1
+        return 1 # TODO cert error coordinated with omsadmin
       end
 
       # Generate the request body
@@ -370,7 +373,7 @@ module MaintenanceModule
 
         if res.code == "200"
           results = 0
-          results = 1 if apply_certificate_update_endpoint(res.body) == 1
+          results = 1 if apply_certificate_update_endpoint(res.body) == 1 # TODO - get general error codes here too
           results = 1 if apply_dsc_endpoint(res.body) == 1
 
           log_info("Heartbeat success") if results == 0
@@ -613,7 +616,7 @@ if __FILE__ == $0
   ret_code = 0
 
   if !maintenance.check_user
-    ret_code = 1
+    ret_code = NON_PRIVELEGED_USER_ERROR_CODE
 
   elsif options[:heartbeat]
     ret_code = maintenance.heartbeat

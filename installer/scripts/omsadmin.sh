@@ -87,6 +87,17 @@ MONITOR_AGENT_PORT=$DEFAULT_MONITOR_AGENT_PORT
 SCX_SSL_CONFIG=/opt/microsoft/scx/bin/tools/scxsslconfig
 OMI_CONF_FILE=/etc/opt/omi/conf/omiserver.conf
 
+# Error codes
+INTERNAL_ERROR=40
+INVALID_OPTION_PROVIDED=41
+MISSING_OMSADMIN_CONF=42
+MISSING_INFO_FROM_OMSADMIN_CONF=43
+ERROR_GENERATING_CERTS=44
+INVALID_CONFIG_PROVIDED=45
+ERROR_ONBOARDING=46
+OMSCONFIG_ERROR=47
+# TODO
+
 usage()
 {
     local basename=`basename $0`
@@ -115,7 +126,6 @@ usage()
     echo
     echo "Azure resource ID:"
     echo "$basename -a <Azure resource ID>"
-    clean_exit 1
 }
 
 set_user_agent()
@@ -159,14 +169,14 @@ load_config()
 {
     if [ ! -e "$CONF_OMSADMIN" ]; then
         log_error "Missing configuration file : $CONF_OMSADMIN"
-        clean_exit 1
+        clean_exit $MISSING_OMSADMIN_CONF
     fi
 
     . "$CONF_OMSADMIN"
 
     if [ -z "$WORKSPACE_ID" -o -z "$AGENT_GUID" ]; then
         log_error "Missing required field from configuration file: $CONF_OMSADMIN"
-        clean_exit 1
+        clean_exit $MISSING_INFO_FROM_OMSADMIN_CONF
     fi
 
     # In the upgrade scenario, the URL_TLD doesn't have the .com part
@@ -213,6 +223,7 @@ parse_args()
         case "$opt" in
         h|\?)
             usage
+            clean_exit 0
             ;;
         s)
             ONBOARDING=1
@@ -263,11 +274,13 @@ parse_args()
     if [ "$@ " != " " ]; then
         log_error "Parsing error: '$@' is unparsed"
         usage
+        clean_exit $INVALID_OPTION_PROVIDED
     fi
 
     if [ -n "$PROXY_USER" -a -z "$PROXY_HOST" ]; then
         log_error "Cannot specify the proxy user without specifying the proxy host"
         usage
+        clean_exit $INVALID_CONFIG_PROVIDED
     fi
 
     if [ -n "$PROXY_HOST" ]; then
@@ -365,7 +378,7 @@ onboard_scom()
         $SCX_SSL_CONFIG -c -g $CERT_DIR
         if [ $? -ne 0 ]; then
           log_error "Error generating certs"
-          clean_exit 1
+          clean_exit $ERROR_GENERATING_CERTS
         fi
         # Rename cert/key to more meaningful name
         mv $CERT_DIR/omi-host-*.pem $CERT_DIR/scom-cert.pem
@@ -430,12 +443,12 @@ onboard()
     local error=0
     if [ -z "$WORKSPACE_ID" -o -z "$SHARED_KEY" ]; then
         log_error "Missing Workspace ID or Shared Key information for onboarding"
-        clean_exit 1
+        clean_exit $INVALID_CONFIG_PROVIDED
     fi
 
     if echo "$WORKSPACE_ID" | grep -Eqv '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'; then
         log_error "The Workspace ID is not valid"
-        clean_exit 1
+        clean_exit $INVALID_CONFIG_PROVIDED
     fi
 
     create_workspace_directories $WORKSPACE_ID
@@ -448,14 +461,15 @@ onboard()
         AGENT_GUID=`$RUBY -e "require 'securerandom'; print SecureRandom.uuid"`
         $RUBY $MAINTENANCE_TASKS_SCRIPT -c "$CONF_OMSADMIN" "$FILE_CRT" "$FILE_KEY" "$RUN_DIR/omsagent.pid" "$CONF_PROXY" "$OS_INFO" "$INSTALL_INFO" -w "$WORKSPACE_ID" -a "$AGENT_GUID" $CURL_VERBOSE
         if [ $? -ne 0 ]; then
-          log_error "Error generating certs"
-          clean_exit 1
+            log_error "Error generating certs"
+            # TODO can I return something more exact here?
+            clean_exit $ERROR_GENERATING_CERTS
         fi
     fi
 
     if [ -z "$AGENT_GUID" ]; then
         log_error "AGENT_GUID should not be empty"
-        return 1
+        return $INTERNAL_ERROR
     else
         log_info "Agent GUID is $AGENT_GUID"
     fi
@@ -473,7 +487,7 @@ onboard()
 
     # append telemetry to $BODY_ONBOARD
     `$RUBY $TOPOLOGY_REQ_SCRIPT -t "$BODY_ONBOARD" "$OS_INFO" "$CONF_OMSADMIN" "$AGENT_GUID" "$CERT_SERVER" "$RUN_DIR/omsagent.pid"` 
-    [ $? -ne 0 ] && log_error "Error appending Telemetry during Onboarding. "
+    [ $? -ne 0 ] && log_error "Error appending Telemetry during Onboarding."
 
     cat /dev/null > "$SHARED_KEY_FILE"
     chmod 600 "$SHARED_KEY_FILE"
@@ -518,7 +532,7 @@ onboard()
     if [ $error -ne 0 ]; then
         log_error "Error during the onboarding request. Check the correctness of the workspace ID and shared key or run omsadmin.sh with '-v'"
         rm "$FILE_CRT" "$FILE_KEY" > /dev/null 2>&1 || true
-        return 1
+        return $ERROR_ONBOARDING
     fi
 
     if [ "$RET_CODE" = "200" ]; then
@@ -537,11 +551,11 @@ onboard()
         REASON=`cat $RESP_ONBOARD | sed -n 's:.*<Reason>\(.*\)</Reason>.*:\1:p'`
         log_error "Error onboarding. HTTP code 403, Reason: $REASON. Check the Workspace ID, Workspace Key and that the time of the system is correct."
         rm "$FILE_CRT" "$FILE_KEY" > /dev/null 2>&1 || true
-        return 1
+        return $ERROR_ONBOARDING
     else
         log_error "Error onboarding. HTTP code $RET_CODE"
         rm "$FILE_CRT" "$FILE_KEY" > /dev/null 2>&1 || true
-        return 1
+        return $ERROR_ONBOARDING
     fi
 
     save_config
@@ -582,7 +596,7 @@ onboard()
                 log_info "Configured omsconfig"
             else
                 log_error "Error configuring omsconfig"
-                return 1
+                return $OMSCONFIG_ERROR
             fi
     
             # Set up a cron job to run the OMSConsistencyInvoker every 5 minutes
@@ -992,11 +1006,15 @@ main()
             ONBOARD_FROM_FILE=1
         else
             usage
+            clean_exit $INVALID_OPTION_PROVIDED
         fi
     fi
 
     if [ "$ONBOARDING" = "1" ]; then
-        onboard || clean_exit 1
+        onboard || error=$?
+        if [ $error -ne 0 ]; then
+            clean_exit $error
+        fi
     fi
 
     if [ "$LIST_WORKSPACES" = "1" ]; then
