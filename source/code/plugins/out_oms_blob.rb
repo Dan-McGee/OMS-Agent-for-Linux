@@ -54,9 +54,10 @@ module Fluent
     #   uri: URI. blob URI
     #   msg: string. body of the request
     #   file_path: string. file path
+    #   get_etag: bool. True if we should request the ETag
     # returns:
     #   HTTPRequest. blob PUT request
-    def create_blob_put_request(uri, msg, request_id, file_path = nil)
+    def create_blob_put_request(uri, msg, request_id, file_path = nil, get_etag = false)
       headers = {}
 
       headers[OMS::CaseSensitiveString.new("x-ms-meta-TimeZoneid")] = OMS::Common.get_current_timezone
@@ -84,6 +85,11 @@ module Fluent
 
       headers["Content-Type"] = "application/octet-stream"
       headers["Content-Length"] = msg.bytesize.to_s
+
+      if get_etag
+         # If the request version is 2011-08-18 or newer, the ETag value will be returned
+         headers[OMS::CaseSensitiveString.new("x-ms-version")] = "2011-08-18"
+      end
 
       req = Net::HTTP::Put.new(uri.request_uri, headers)
       req.body = msg
@@ -151,8 +157,13 @@ module Fluent
       else
         blocks_committed = []
       end
+      if blob_json.has_key?("Size")
+        blob_size = blob_json["Size"]
+      else
+        blob_size = 0
+      end
 
-      return blob_uri, blocks_committed
+      return blob_uri, blocks_committed, blob_size
     end # get_blob_uri_and_committed_blocks
 
     # append data to the blob
@@ -184,8 +195,8 @@ module Fluent
       end
 
       # commit blocks
-      commit_blocks(uri, blocks_committed, blocks_uncommitted, file_path)
-      return dataSize
+      etag = commit_blocks(uri, blocks_committed, blocks_uncommitted, file_path)
+      return dataSize, etag
     end # append_blob
 
     # upload one block to the blob
@@ -222,24 +233,50 @@ module Fluent
 
       blocklist_uri = URI.parse("#{uri.to_s}&comp=blocklist")
       request_id = SecureRandom.uuid
-      put_blocklist_req = create_blob_put_request(blocklist_uri, commit_msg, request_id, file_path)
+      put_blocklist_req = create_blob_put_request(blocklist_uri, commit_msg, request_id, file_path, get_etag = true)
       http = OMS::Common.create_secure_http(blocklist_uri, @proxy_config)
-      OMS::Common.start_request(put_blocklist_req, http)
+      response = OMS::Common.start_request(put_blocklist_req, http, ignore404 = false, return_entire_response = true)
+
+      begin
+        etag_quoted = response.to_hash["etag"]
+        if etag_quoted.is_a?(Array)
+          etag_quoted = etag_quoted[0]
+        end
+        etag = etag_quoted.gsub(/"/, "")
+      rescue => e
+        @log.error("Cannot extract ETag from BLOB response #{response}. Error:'#{e}'")
+        etag = ""
+      end
+      return etag
     end # commit_blocks
 
-    def notify_blob_upload_complete(uri, data_type, custom_data_type)
+    # Notify ODS that we have completed uploading to the BLOB
+    # Parameters:
+    #   uri: URI. blob URI
+    #   data_type: string. DataTypeId of the data
+    #   custom_data_type: string. CustomDataType of the CustomLog
+    #   offset_blob_size: int. Amount of data that BLOB contained before we appended to it
+    #   sent_size: int. Amount of data we appended to the BLOB
+    #   etag: string. ETag from the BLOB for this data
+    def notify_blob_upload_complete(uri, data_type, custom_data_type, offset_blob_size, sent_size, etag)
       data_type_id = data_type
       if !custom_data_type.nil?
         data_type_id = "#{data_type}.#{custom_data_type}"
       end
+
+      # Remove SAS token from the URL
+      blob_url = uri.to_s.split("?")[0]
 
       data = {
         "DataType" => "BLOB_UPLOAD_NOTIFICATION",
         "IPName" => "",
         "DataItems" => [
           {
-            "BlobUrl" => uri.to_s,
-            "OriginalDataTypeId" => data_type_id
+            "BlobUrl" => blob_url,
+            "OriginalDataTypeId" => data_type_id,
+            "StartOffset" => offset_blob_size,
+            "FileSize" => sent_size,
+            "Etag" => etag
           }
         ]
       }
@@ -288,17 +325,17 @@ module Fluent
       end
 
       start = Time.now
-      blob_uri, blocks_committed = get_blob_uri_and_committed_blocks(container_type, data_type, custom_data_type, suffix)
+      blob_uri, blocks_committed, blob_size = get_blob_uri_and_committed_blocks(container_type, data_type, custom_data_type, suffix)
       time = Time.now - start
-      @log.debug "Success getting the BLOB uri and committed block list in #{time.round(3)}s"
+      @log.debug "Success getting the BLOB information in #{time.round(3)}s"
 
       start = Time.now
-      dataSize = append_blob(blob_uri, records, filePath, blocks_committed)
+      dataSize, etag = append_blob(blob_uri, records, filePath, blocks_committed)
       time = Time.now - start
       @log.debug "Success sending #{dataSize} bytes of data to BLOB #{time.round(3)}s"
 
       start = Time.now
-      notify_blob_upload_complete(blob_uri, data_type, custom_data_type)
+      notify_blob_upload_complete(blob_uri, data_type, custom_data_type, blob_size, dataSize, etag)
       time = Time.now - start
       @log.trace "Success notify the data to BLOB #{time.round(3)}s"
 
